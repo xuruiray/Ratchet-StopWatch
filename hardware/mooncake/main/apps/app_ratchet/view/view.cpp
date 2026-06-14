@@ -431,20 +431,21 @@ void play_ratchet_click()
 RatchetView::~RatchetView()
 {
     stopGearBuilderTask();
+    _touch_mask.reset();
+    _notch_image.reset();
+    _highlight_overlay.reset();
+    _gear_image.reset();
     clearRuntimeBuffers();
 }
 
 bool RatchetView::buildRuntimeGearFrames()
 {
     constexpr std::size_t pixel_count = static_cast<std::size_t>(_gear_size) * static_cast<std::size_t>(_gear_size);
-    constexpr std::size_t frame_bytes = pixel_count * 2;
-    _gear_frame_data =
-        static_cast<uint8_t*>(allocate_psram_buffer(frame_bytes * _gear_frame_count, "gear frames"));
     _gear_radius_cache =
         static_cast<uint16_t*>(allocate_psram_buffer(pixel_count * sizeof(uint16_t), "gear radius cache"));
     _gear_degrees_cache =
         static_cast<int16_t*>(allocate_psram_buffer(pixel_count * sizeof(int16_t), "gear angle cache"));
-    if (_gear_frame_data == nullptr || _gear_radius_cache == nullptr || _gear_degrees_cache == nullptr) {
+    if (_gear_radius_cache == nullptr || _gear_degrees_cache == nullptr) {
         clearRuntimeBuffers();
         return false;
     }
@@ -456,15 +457,14 @@ bool RatchetView::buildRuntimeGearFrames()
     const float center = static_cast<float>(_gear_size) * 0.5f;
 
     for (int frame = 0; frame < _gear_frame_count; ++frame) {
-        uint8_t* frame_data = _gear_frame_data + (static_cast<std::size_t>(frame) * frame_bytes);
         auto& dsc            = _gear_frame_dscs[frame];
         dsc                  = {};
         dsc.header.cf        = LV_COLOR_FORMAT_RGB565;
         dsc.header.magic     = LV_IMAGE_HEADER_MAGIC;
         dsc.header.w         = _gear_size;
         dsc.header.h         = _gear_size;
-        dsc.data_size        = frame_bytes;
-        dsc.data             = frame_data;
+        dsc.data_size        = pixel_count * 2;
+        dsc.data             = nullptr;
     }
 
     for (int y = 0; y < _gear_size; ++y) {
@@ -484,19 +484,42 @@ bool RatchetView::buildRuntimeGearFrames()
     return _gear_frame_ready[0].load(std::memory_order_acquire) != 0;
 }
 
+bool RatchetView::ensureGearFrameBuffer(int frame)
+{
+    if (frame < 0 || frame >= _gear_frame_count) {
+        return false;
+    }
+    if (_gear_frame_data[frame] != nullptr) {
+        return true;
+    }
+
+    constexpr std::size_t pixel_count = static_cast<std::size_t>(_gear_size) * static_cast<std::size_t>(_gear_size);
+    constexpr std::size_t frame_bytes = pixel_count * 2;
+    auto* frame_data = static_cast<uint8_t*>(allocate_psram_buffer(frame_bytes, "gear frame"));
+    if (frame_data == nullptr) {
+        mclog::tagError(_log_tag, "gear frame {} unavailable", frame);
+        return false;
+    }
+
+    _gear_frame_data[frame]     = frame_data;
+    _gear_frame_dscs[frame].data = frame_data;
+    return true;
+}
+
 void RatchetView::renderGearFrame(int frame)
 {
-    if (frame < 0 || frame >= _gear_frame_count || _gear_frame_data == nullptr ||
+    if (frame < 0 || frame >= _gear_frame_count ||
         _gear_radius_cache == nullptr || _gear_degrees_cache == nullptr) {
         return;
     }
     if (_gear_frame_ready[frame].load(std::memory_order_acquire) != 0) {
         return;
     }
+    if (!ensureGearFrameBuffer(frame)) {
+        return;
+    }
 
-    constexpr std::size_t pixel_count = static_cast<std::size_t>(_gear_size) * static_cast<std::size_t>(_gear_size);
-    constexpr std::size_t frame_bytes = pixel_count * 2;
-    uint8_t* frame_data = _gear_frame_data + (static_cast<std::size_t>(frame) * frame_bytes);
+    uint8_t* frame_data = _gear_frame_data[frame];
     const float phase   = (static_cast<float>(frame) / static_cast<float>(_gear_frame_count)) * _tooth_angle_deg;
 
     const TaskHandle_t builder_task = _gear_builder_task.load(std::memory_order_acquire);
@@ -543,6 +566,8 @@ void RatchetView::startGearBuilderTask()
         &created_task);
     if (result != pdPASS) {
         _gear_builder_task.store(nullptr, std::memory_order_release);
+        mclog::tagError(_log_tag, "failed to start gear frame builder task");
+        clearGearBuildCache();
         return;
     }
     _gear_builder_task.store(created_task, std::memory_order_release);
@@ -622,7 +647,9 @@ void RatchetView::clearRuntimeBuffers()
 
     _highlight_overlay_dsc = {};
     _notch_image_dsc       = {};
-    free_heap_buffer(_gear_frame_data);
+    for (auto& frame_data : _gear_frame_data) {
+        free_heap_buffer(frame_data);
+    }
     free_heap_buffer(_highlight_overlay_data);
     free_heap_buffer(_notch_image_data);
     clearGearBuildCache();
@@ -716,8 +743,8 @@ void RatchetView::init(lv_obj_t* parent)
     _panel->setBgOpa(LV_OPA_COVER);
     _panel->removeFlag(LV_OBJ_FLAG_SCROLLABLE);
 
-    if (!buildRuntimeGearFrames() || !buildHighlightOverlayImage() || !buildNotchImage()) {
-        mclog::tagError(_log_tag, "runtime image initialization failed");
+    if (!buildRuntimeGearFrames()) {
+        mclog::tagError(_log_tag, "gear frame initialization failed");
         clearRuntimeBuffers();
         return;
     }
@@ -727,13 +754,21 @@ void RatchetView::init(lv_obj_t* parent)
     _gear_image->setSrc(&_gear_frame_dscs[0]);
     _gear_image->setPos(_panel_center - _gear_pivot, _panel_center - _gear_pivot);
 
-    _highlight_overlay = std::make_unique<Image>(_panel->get());
-    _highlight_overlay->setSrc(&_highlight_overlay_dsc);
-    _highlight_overlay->setPos(_panel_center - _gear_pivot, _panel_center - _gear_pivot);
+    if (buildHighlightOverlayImage()) {
+        _highlight_overlay = std::make_unique<Image>(_panel->get());
+        _highlight_overlay->setSrc(&_highlight_overlay_dsc);
+        _highlight_overlay->setPos(_panel_center - _gear_pivot, _panel_center - _gear_pivot);
+    } else {
+        mclog::tagError(_log_tag, "highlight overlay unavailable");
+    }
 
-    _notch_image = std::make_unique<Image>(_panel->get());
-    _notch_image->setSrc(&_notch_image_dsc);
-    _notch_image->setPivot(_notch_pivot_x, _notch_pivot_y);
+    if (buildNotchImage()) {
+        _notch_image = std::make_unique<Image>(_panel->get());
+        _notch_image->setSrc(&_notch_image_dsc);
+        _notch_image->setPivot(_notch_pivot_x, _notch_pivot_y);
+    } else {
+        mclog::tagError(_log_tag, "notch image unavailable");
+    }
 
     prepare_ratchet_click();
 

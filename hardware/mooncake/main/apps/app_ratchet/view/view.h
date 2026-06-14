@@ -27,7 +27,7 @@ public:
 private:
     std::unique_ptr<uitk::lvgl_cpp::Container> _panel;
     std::unique_ptr<uitk::lvgl_cpp::Container> _touch_mask;
-    uint8_t* _gear_frame_data = nullptr;
+    std::array<uint8_t*, GearFrameCount> _gear_frame_data = {};
     std::array<lv_image_dsc_t, GearFrameCount> _gear_frame_dscs = {};
     std::array<std::atomic<uint8_t>, GearFrameCount> _gear_frame_ready = {};
     uint16_t* _gear_radius_cache = nullptr;
@@ -63,6 +63,7 @@ private:
     void applyGearFrame(bool force = false);
     void applyNotchTransform();
     void renderGearFrame(int frame);
+    bool ensureGearFrameBuffer(int frame);
     void clearGearBuildCache();
     void clearRuntimeBuffers();
     void startGearBuilderTask();
