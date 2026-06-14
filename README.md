@@ -2,14 +2,37 @@
 
 Ratchet gear app extracted from the M5Stack StopWatch firmware work.
 
-This repository contains the reusable Mooncake/LVGL hardware app module:
+This repository contains two related parts:
+
+- `web/`: standalone HTML prototype for interaction and motion tuning.
+- `hardware/mooncake/`: reusable Mooncake/LVGL hardware app module.
+
+## Web Prototype
+
+Open the page directly in a browser:
+
+```bash
+open web/index.html
+```
+
+The prototype mirrors the device interaction model:
+
+- Drag the gear to rotate it.
+- Release after motion to continue with short inertia.
+- Left key/button kicks the gear counterclockwise.
+- Right key/button kicks the gear clockwise.
+- Press both keys while inertia is active to stop the gear.
+- Tooth-crossing feedback follows the same 9-tooth, 120ms minimum interval logic.
+
+## Hardware App
+
+The hardware app source is stored under the same path shape used by the
+StopWatch firmware:
 
 ```text
 hardware/mooncake/main/apps/app_ratchet/
 hardware/mooncake/main/assets/images/icon_ratchet.c
 ```
-
-## Hardware App
 
 The app provides a rotary ratchet interaction for the StopWatch device:
 

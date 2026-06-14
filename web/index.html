@@ -1,0 +1,756 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ratchet Prototype</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --page: #111418;
+      --panel: #000;
+      --text: #d9e0e5;
+      --muted: #7e8a93;
+      --line: #2a3138;
+      --button: #202832;
+      --button-on: #344354;
+      --button-border: #495766;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      background: radial-gradient(circle at 50% 22%, #1b222a 0, var(--page) 58%, #090b0e 100%);
+      color: var(--text);
+    }
+
+    .shell {
+      width: min(100vw, 540px);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      padding: 18px;
+    }
+
+    .watch {
+      width: min(94vw, 466px);
+      aspect-ratio: 1;
+      border-radius: 50%;
+      background: var(--panel);
+      border: 1px solid #20252a;
+      box-shadow:
+        0 26px 80px rgba(0, 0, 0, 0.45),
+        inset 0 0 0 1px rgba(255, 255, 255, 0.03);
+      overflow: hidden;
+      position: relative;
+      touch-action: none;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+      cursor: grab;
+    }
+
+    canvas.dragging {
+      cursor: grabbing;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: 84px 1fr 84px;
+      align-items: center;
+      gap: 14px;
+      width: min(94vw, 466px);
+    }
+
+    .key {
+      height: 52px;
+      border: 1px solid var(--button-border);
+      border-radius: 26px;
+      background: linear-gradient(180deg, #26313d, var(--button));
+      color: var(--text);
+      font: 700 18px/1 inherit;
+      letter-spacing: 0;
+      box-shadow: inset 0 1px rgba(255, 255, 255, 0.08), 0 10px 22px rgba(0, 0, 0, 0.22);
+      cursor: pointer;
+    }
+
+    .key.active {
+      background: linear-gradient(180deg, #405066, var(--button-on));
+      transform: translateY(1px);
+    }
+
+    .readout {
+      min-width: 0;
+      display: grid;
+      gap: 4px;
+      justify-items: center;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .name {
+      color: var(--text);
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .metric {
+      font-variant-numeric: tabular-nums;
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="watch">
+      <canvas id="ratchet" width="466" height="466" aria-label="Ratchet gear"></canvas>
+    </section>
+    <section class="controls">
+      <button class="key" id="leftKey" type="button">A</button>
+      <div class="readout">
+        <div class="name">Ratchet</div>
+        <div class="metric" id="metric">0 deg/s</div>
+      </div>
+      <button class="key" id="rightKey" type="button">B</button>
+    </section>
+  </main>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const panelSize = 466;
+      const panelCenter = panelSize / 2;
+      const gearSize = 300;
+      const gearPivot = gearSize / 2;
+      const gearTeeth = 9;
+      const gearFrameCount = 16;
+      const toothAngleDeg = 360 / gearTeeth;
+      const gearTouchRadiusMin = 32;
+      const gearTouchRadiusMax = 178;
+      const gearOuterRadius = 139;
+      const gearRootRadius = 115;
+      const gearFaceRadius = 102;
+      const gearHubOuterRadius = 47;
+      const gearHubMidRadius = 36;
+      const gearHubHoleRadius = 25;
+      const notchWidth = 52;
+      const notchHeight = 18;
+      const notchPivotX = notchWidth / 2;
+      const notchPivotY = notchHeight / 2;
+      const notchOrbitRadius = 36;
+      const feedbackIntervalMs = 120;
+      const vibrateDurationMs = 20;
+      const velocityFilterKeep = 0.65;
+      const velocityFilterNew = 0.35;
+      const maxAngularVelocityDegS = 1200;
+      const inertiaReleaseBoost = 1.10;
+      const inertiaStartVelocityDegS = 65;
+      const inertiaStopVelocityDegS = 26;
+      const inertiaBaseDecelDegS2 = 430;
+      const inertiaSpeedDecelRatio = 0.42;
+      const releaseVelocityGraceMs = 180;
+      const dragIdleDampingDelayMs = 120;
+      const maxInertiaStepMs = 50;
+
+      const canvas = document.getElementById("ratchet");
+      const ctx = canvas.getContext("2d", { alpha: false });
+      const metric = document.getElementById("metric");
+      const leftKey = document.getElementById("leftKey");
+      const rightKey = document.getElementById("rightKey");
+
+      const state = {
+        dragging: false,
+        displayRotationDeg: 0,
+        angularVelocityDegS: 0,
+        lastTouchAngle: 0,
+        lastToothIndex: 0,
+        hasFeedback: false,
+        lastFeedbackTick: 0,
+        lastMotionTick: performance.now(),
+        lastTouchTick: performance.now(),
+        lastDragMotionTick: performance.now(),
+        inertiaActive: false,
+        pointerId: null,
+        leftDown: false,
+        rightDown: false,
+      };
+
+      const gearFrames = Array.from({ length: gearFrameCount }, (_, frame) => renderGearFrame(frame));
+      const highlightOverlay = renderHighlightOverlay();
+      const notchImage = renderNotchImage();
+      let audioContext = null;
+      let clickBuffer = null;
+
+      function clamp(value, min, max) {
+        return Math.min(max, Math.max(min, value));
+      }
+
+      function clamp01(value) {
+        return clamp(value, 0, 1);
+      }
+
+      function mixColor(a, b, t) {
+        t = clamp01(t);
+        const ar = (a >> 16) & 255;
+        const ag = (a >> 8) & 255;
+        const ab = a & 255;
+        const br = (b >> 16) & 255;
+        const bg = (b >> 8) & 255;
+        const bb = b & 255;
+        const rr = Math.round(ar + (br - ar) * t);
+        const rg = Math.round(ag + (bg - ag) * t);
+        const rb = Math.round(ab + (bb - ab) * t);
+        return (rr << 16) | (rg << 8) | rb;
+      }
+
+      function colorToCss(color, alpha = 1) {
+        const r = (color >> 16) & 255;
+        const g = (color >> 8) & 255;
+        const b = color & 255;
+        return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+      }
+
+      function smoothBand(distance, halfWidth, feather) {
+        return clamp01((halfWidth + feather - Math.abs(distance)) / Math.max(0.001, feather));
+      }
+
+      function normalizeDeltaDegrees(delta) {
+        while (delta > 180) delta -= 360;
+        while (delta < -180) delta += 360;
+        return delta;
+      }
+
+      function normalizedDegrees(degrees) {
+        degrees %= 360;
+        if (degrees < 0) degrees += 360;
+        return degrees;
+      }
+
+      function toothPhaseDegrees(rotationDeg) {
+        let phase = rotationDeg % toothAngleDeg;
+        if (phase < 0) phase += toothAngleDeg;
+        return phase;
+      }
+
+      function frameIndexForRotation(rotationDeg) {
+        const phase = toothPhaseDegrees(rotationDeg);
+        return Math.floor((phase / toothAngleDeg) * gearFrameCount + 0.5) % gearFrameCount;
+      }
+
+      function toothIndexForRotation(rotationDeg) {
+        return Math.floor(rotationDeg / toothAngleDeg);
+      }
+
+      function toothBoundaryRadius(degrees) {
+        let phase = (degrees + 90) % toothAngleDeg;
+        if (phase < 0) phase += toothAngleDeg;
+        phase /= toothAngleDeg;
+
+        if (phase < 0.02) return gearRootRadius;
+        if (phase < 0.16) return gearRootRadius + (gearOuterRadius - gearRootRadius) * ((phase - 0.02) / 0.14);
+        if (phase < 0.53) return gearOuterRadius;
+        if (phase < 0.80) return gearOuterRadius - (gearOuterRadius - gearRootRadius) * ((phase - 0.53) / 0.27);
+        return gearRootRadius;
+      }
+
+      function toothBoundaryPhase(degrees) {
+        let phase = (degrees + 90) % toothAngleDeg;
+        if (phase < 0) phase += toothAngleDeg;
+        return Math.min(phase, toothAngleDeg - phase);
+      }
+
+      function composeBodyColor(radius, degrees) {
+        const boundaryRadius = toothBoundaryRadius(degrees);
+        let color = radius > gearRootRadius ? 0x11161b : 0x090c10;
+
+        if (radius <= gearFaceRadius) color = 0x0b1116;
+
+        const outerEdge = boundaryRadius - radius;
+        if (outerEdge >= 0) {
+          color = mixColor(color, 0x53606a, smoothBand(outerEdge - 3.5, 4.0, 1.2));
+          color = mixColor(color, 0xe4e8ea, smoothBand(outerEdge - 1.2, 1.3, 0.8));
+        }
+
+        color = mixColor(color, 0x1f2830, smoothBand(radius - (gearRootRadius - 5), 2.2, 0.8));
+        color = mixColor(color, 0xd7dcdf, smoothBand(radius - (gearRootRadius - 13), 1.7, 0.7));
+        color = mixColor(color, 0x303941, smoothBand(radius - (gearFaceRadius - 11), 1.0, 0.7) * 0.8);
+
+        for (let ring = 60; ring <= 96; ring += 6) {
+          const tone = ring % 12 === 0 ? 0x20282f : 0x151d24;
+          color = mixColor(color, tone, smoothBand(radius - ring, 0.45, 0.5) * 0.7);
+        }
+
+        if (radius >= gearFaceRadius - 10 && radius <= gearRootRadius - 16) {
+          color = mixColor(color, 0x444e57, smoothBand(toothBoundaryPhase(degrees), 0.42, 0.4) * 0.75);
+        }
+
+        if (radius <= gearHubOuterRadius) color = 0x050607;
+        color = mixColor(color, 0xe5e8ea, smoothBand(radius - gearHubOuterRadius, 2.8, 0.9));
+        color = mixColor(color, 0x6a747c, smoothBand(radius - gearHubMidRadius, 2.7, 0.9));
+        color = mixColor(color, 0xdfe2e4, smoothBand(radius - (gearHubMidRadius - 9), 1.0, 0.7));
+        color = mixColor(color, 0xeaf0f2, smoothBand(radius - gearHubHoleRadius, 1.8, 0.8));
+
+        return color;
+      }
+
+      function gearAlpha(radius, degrees) {
+        const outer = toothBoundaryRadius(degrees) - radius;
+        const hole = radius - (gearHubHoleRadius - 2);
+        return clamp01((outer + 1.25) / 2.5) * clamp01((hole + 1.25) / 2.5);
+      }
+
+      function renderGearFrame(frame) {
+        const offscreen = document.createElement("canvas");
+        offscreen.width = gearSize;
+        offscreen.height = gearSize;
+        const frameCtx = offscreen.getContext("2d");
+        const image = frameCtx.createImageData(gearSize, gearSize);
+        const phase = (frame / gearFrameCount) * toothAngleDeg;
+        const center = gearSize * 0.5;
+
+        for (let y = 0; y < gearSize; y += 1) {
+          for (let x = 0; x < gearSize; x += 1) {
+            const index = (y * gearSize + x) * 4;
+            const localX = x + 0.5 - center;
+            const localY = y + 0.5 - center;
+            const radius = Math.sqrt(localX * localX + localY * localY);
+            const degrees = Math.atan2(localY, localX) * 180 / Math.PI - phase;
+            const alpha = gearAlpha(radius, degrees);
+            const body = alpha === 0 ? 0 : composeBodyColor(radius, degrees);
+            image.data[index] = Math.round(((body >> 16) & 255) * alpha);
+            image.data[index + 1] = Math.round(((body >> 8) & 255) * alpha);
+            image.data[index + 2] = Math.round((body & 255) * alpha);
+            image.data[index + 3] = 255;
+          }
+        }
+
+        frameCtx.putImageData(image, 0, 0);
+        return offscreen;
+      }
+
+      function overlayAlphaForRadius(radius, inner, outer, feather) {
+        const innerAlpha = clamp01((radius - inner + feather) / feather);
+        const outerAlpha = clamp01((outer - radius + feather) / feather);
+        return innerAlpha * outerAlpha;
+      }
+
+      function composeHighlightOverlayColor(x, y) {
+        const radius = Math.sqrt(x * x + y * y);
+        const faceMask = overlayAlphaForRadius(radius, gearHubOuterRadius + 7, gearFaceRadius - 4, 7);
+        const hubMask = overlayAlphaForRadius(radius, gearHubHoleRadius + 4, gearHubOuterRadius - 4, 5);
+        const topLeft = clamp01(((-x - y) / gearFaceRadius + 0.78) * 0.58);
+        const bottomRight = clamp01(((x + y) / gearFaceRadius + 0.62) * 0.42);
+        const diagonalBand = smoothBand((x + y) * 0.707 + 22, 13, 22);
+        const ringLip = Math.max(
+          smoothBand(radius - (gearFaceRadius - 10), 1.5, 0.8),
+          smoothBand(radius - (gearHubOuterRadius - 1), 2.0, 0.9),
+        );
+        const hubLip = smoothBand(radius - (gearHubHoleRadius + 1.5), 1.4, 0.8);
+
+        const shine = faceMask * (topLeft * 0.16 + diagonalBand * 0.14) +
+          hubMask * (topLeft * 0.18 + ringLip * 0.24 + hubLip * 0.20);
+        const shade = faceMask * bottomRight * 0.10;
+
+        if (shine >= shade) return { color: 0xf4fbff, alpha: clamp01(shine) };
+        return { color: 0x000000, alpha: clamp01(shade) };
+      }
+
+      function renderHighlightOverlay() {
+        const offscreen = document.createElement("canvas");
+        offscreen.width = gearSize;
+        offscreen.height = gearSize;
+        const overlayCtx = offscreen.getContext("2d");
+        const image = overlayCtx.createImageData(gearSize, gearSize);
+        const center = gearSize * 0.5;
+
+        for (let y = 0; y < gearSize; y += 1) {
+          for (let x = 0; x < gearSize; x += 1) {
+            const index = (y * gearSize + x) * 4;
+            const localX = x + 0.5 - center;
+            const localY = y + 0.5 - center;
+            const { color, alpha } = composeHighlightOverlayColor(localX, localY);
+            image.data[index] = (color >> 16) & 255;
+            image.data[index + 1] = (color >> 8) & 255;
+            image.data[index + 2] = color & 255;
+            image.data[index + 3] = Math.round(alpha * 255);
+          }
+        }
+
+        overlayCtx.putImageData(image, 0, 0);
+        return offscreen;
+      }
+
+      function renderNotchImage() {
+        const offscreen = document.createElement("canvas");
+        offscreen.width = notchWidth;
+        offscreen.height = notchHeight;
+        const notchCtx = offscreen.getContext("2d");
+        const image = notchCtx.createImageData(notchWidth, notchHeight);
+
+        for (let y = 0; y < notchHeight; y += 1) {
+          for (let x = 0; x < notchWidth; x += 1) {
+            const index = (y * notchWidth + x) * 4;
+            const localX = x + 0.5 - notchPivotX;
+            const localY = y + 0.5 - notchPivotY;
+            const halfLen = 19.0;
+            const halfWidth = 3.4;
+            const dx = Math.abs(localX) - halfLen;
+            const dy = Math.abs(localY) - halfWidth;
+            const outside = Math.max(dx, dy);
+            const coverage = clamp01((2.0 - outside) / 2.0);
+            const endRound = clamp01((halfLen + 4.5 - Math.sqrt(localX * localX + localY * localY)) / 3.8);
+            const body = Math.min(coverage, Math.max(0, endRound));
+            const alpha = body * 230 / 255;
+            const highlight = clamp01((-localY + 2.5) / 7.5);
+            const color = mixColor(0x4a535a, 0xf1f8fb, highlight);
+            image.data[index] = (color >> 16) & 255;
+            image.data[index + 1] = (color >> 8) & 255;
+            image.data[index + 2] = color & 255;
+            image.data[index + 3] = Math.round(alpha * 255);
+          }
+        }
+
+        notchCtx.putImageData(image, 0, 0);
+        return offscreen;
+      }
+
+      function canvasPoint(event) {
+        const rect = canvas.getBoundingClientRect();
+        const scale = panelSize / rect.width;
+        return {
+          x: (event.clientX - rect.left) * scale,
+          y: (event.clientY - rect.top) * scale,
+        };
+      }
+
+      function isTouchOnGear(point) {
+        const dx = point.x - panelCenter;
+        const dy = point.y - panelCenter;
+        const distanceSq = dx * dx + dy * dy;
+        return distanceSq >= gearTouchRadiusMin * gearTouchRadiusMin &&
+          distanceSq <= gearTouchRadiusMax * gearTouchRadiusMax;
+      }
+
+      function touchAngleDegrees(point) {
+        return Math.atan2(point.y - panelCenter, point.x - panelCenter) * 180 / Math.PI;
+      }
+
+      function updateToothFeedback() {
+        const toothIndex = toothIndexForRotation(state.displayRotationDeg);
+        if (toothIndex === state.lastToothIndex) return;
+        state.lastToothIndex = toothIndex;
+        triggerFeedback();
+      }
+
+      function ensureAudio() {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return null;
+        if (!audioContext) audioContext = new Ctx();
+        if (audioContext.state === "suspended") audioContext.resume();
+        return audioContext;
+      }
+
+      function buildClickBuffer(context) {
+        if (clickBuffer && clickBuffer.sampleRate === context.sampleRate) return clickBuffer.buffer;
+        const sampleRate = context.sampleRate;
+        const durationSec = 0.024;
+        const sampleCount = Math.max(1, Math.floor(sampleRate * durationSec));
+        const buffer = context.createBuffer(1, sampleCount, sampleRate);
+        const data = buffer.getChannelData(0);
+        let noiseState = 0x8f21e35b;
+        let previousNoise = 0;
+        let highpassNoise = 0;
+        let maxAbs = 0;
+
+        const render = (write, scale) => {
+          noiseState = 0x8f21e35b;
+          previousNoise = 0;
+          highpassNoise = 0;
+          maxAbs = 0;
+
+          for (let i = 0; i < sampleCount; i += 1) {
+            noiseState = (noiseState * 1664525 + 1013904223) >>> 0;
+            const noise = (((noiseState >>> 8) & 0xffff) / 32767.5) - 1;
+            highpassNoise = 0.78 * (highpassNoise + noise - previousNoise);
+            previousNoise = noise;
+
+            const t = i / sampleRate;
+            const progress = i / Math.max(1, sampleCount - 1);
+            const attack = Math.min(1, t / 0.00025);
+            let sample = highpassNoise * 0.85 * attack * Math.exp(-progress * 15.0);
+            sample += resonance(t, progress, 2600, 0.30, 14.0, 0.3, 0.0);
+            sample += resonance(t, progress, 5100, 0.22, 17.0, 1.1, 0.0002);
+            sample += resonance(t, progress, 7600, 0.12, 19.0, 0.0, 0.0004);
+
+            const fadeSamples = Math.max(1, Math.floor(sampleRate * 0.002));
+            if (i >= sampleCount - fadeSamples) {
+              sample *= (sampleCount - i - 1) / fadeSamples;
+            }
+
+            maxAbs = Math.max(maxAbs, Math.abs(sample));
+            if (write) data[i] = clamp(sample * scale, -1, 1);
+          }
+        };
+
+        const resonance = (t, progress, frequency, amplitude, decay, phase, delaySec) => {
+          if (t < delaySec) return 0;
+          const localT = t - delaySec;
+          const delaySamples = Math.floor(sampleRate * delaySec);
+          const localProgress = (Math.floor(t * sampleRate) - delaySamples) /
+            Math.max(1, sampleCount - delaySamples - 1);
+          return Math.sin(2 * Math.PI * frequency * localT + phase) *
+            amplitude * Math.exp(-localProgress * decay);
+        };
+
+        render(false, 1);
+        render(true, maxAbs > 0 ? 0.82 / maxAbs : 1);
+        clickBuffer = { sampleRate, buffer };
+        return buffer;
+      }
+
+      function triggerFeedback() {
+        const now = performance.now();
+        if (state.hasFeedback && now - state.lastFeedbackTick < feedbackIntervalMs) return;
+
+        state.hasFeedback = true;
+        state.lastFeedbackTick = now;
+        if (navigator.vibrate) navigator.vibrate(vibrateDurationMs);
+
+        const context = ensureAudio();
+        if (!context) return;
+        const source = context.createBufferSource();
+        source.buffer = buildClickBuffer(context);
+        const gain = context.createGain();
+        gain.gain.value = 0.9;
+        source.connect(gain).connect(context.destination);
+        source.start();
+      }
+
+      function stopMotion(stopFeedback = false) {
+        state.inertiaActive = false;
+        state.angularVelocityDegS = 0;
+        if (stopFeedback && navigator.vibrate) navigator.vibrate(0);
+      }
+
+      function kick(direction) {
+        if (state.dragging) return;
+        state.angularVelocityDegS = direction * maxAngularVelocityDegS;
+        state.inertiaActive = true;
+        const now = performance.now();
+        state.lastMotionTick = now;
+        state.lastDragMotionTick = now;
+        state.lastToothIndex = toothIndexForRotation(state.displayRotationDeg);
+        ensureAudio();
+      }
+
+      function updateButtonInput() {
+        const both = state.leftDown && state.rightDown;
+        leftKey.classList.toggle("active", state.leftDown);
+        rightKey.classList.toggle("active", state.rightDown);
+        if (state.dragging) return;
+        if (state.inertiaActive && both) {
+          stopMotion(true);
+          return;
+        }
+        if (both) return;
+        if (state.leftDown) kick(-1);
+        if (state.rightDown) kick(1);
+      }
+
+      function updateInertia(now) {
+        if (!state.inertiaActive || state.dragging) return;
+        if (state.lastMotionTick === 0) {
+          state.lastMotionTick = now;
+          return;
+        }
+
+        const elapsedMs = now - state.lastMotionTick;
+        if (elapsedMs <= 0) return;
+        state.lastMotionTick = now;
+
+        const elapsedSec = Math.min(elapsedMs, maxInertiaStepMs) / 1000;
+        const speed = Math.abs(state.angularVelocityDegS);
+        if (speed < inertiaStopVelocityDegS) {
+          state.inertiaActive = false;
+          state.angularVelocityDegS = 0;
+          return;
+        }
+
+        state.displayRotationDeg += state.angularVelocityDegS * elapsedSec;
+        if (Math.abs(state.displayRotationDeg) > 36000) {
+          state.displayRotationDeg %= 360;
+        }
+        updateToothFeedback();
+
+        const decel = inertiaBaseDecelDegS2 + speed * inertiaSpeedDecelRatio;
+        const nextSpeed = Math.max(0, speed - decel * elapsedSec);
+        if (nextSpeed < inertiaStopVelocityDegS) {
+          state.inertiaActive = false;
+          state.angularVelocityDegS = 0;
+          return;
+        }
+
+        state.angularVelocityDegS = state.angularVelocityDegS > 0 ? nextSpeed : -nextSpeed;
+      }
+
+      function draw() {
+        ctx.fillStyle = "#000";
+        ctx.fillRect(0, 0, panelSize, panelSize);
+
+        const frame = frameIndexForRotation(state.displayRotationDeg);
+        const gearX = panelCenter - gearPivot;
+        const gearY = panelCenter - gearPivot;
+        ctx.drawImage(gearFrames[frame], gearX, gearY);
+        ctx.drawImage(highlightOverlay, gearX, gearY);
+
+        const notchAngle = normalizedDegrees(state.displayRotationDeg - 70);
+        const rad = notchAngle * Math.PI / 180;
+        const x = Math.round(panelCenter + Math.cos(rad) * notchOrbitRadius);
+        const y = Math.round(panelCenter + Math.sin(rad) * notchOrbitRadius);
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.rotate(rad);
+        ctx.drawImage(notchImage, -notchPivotX, -notchPivotY);
+        ctx.restore();
+
+        metric.textContent = `${Math.round(state.angularVelocityDegS)} deg/s`;
+      }
+
+      function animate(now) {
+        updateInertia(now);
+        draw();
+        requestAnimationFrame(animate);
+      }
+
+      canvas.addEventListener("pointerdown", (event) => {
+        const point = canvasPoint(event);
+        if (!isTouchOnGear(point)) return;
+        ensureAudio();
+        canvas.setPointerCapture(event.pointerId);
+        canvas.classList.add("dragging");
+        state.pointerId = event.pointerId;
+        state.dragging = true;
+        state.inertiaActive = false;
+        state.angularVelocityDegS = 0;
+        state.lastTouchAngle = touchAngleDegrees(point);
+        const now = performance.now();
+        state.lastTouchTick = now;
+        state.lastMotionTick = now;
+        state.lastDragMotionTick = now;
+        state.lastToothIndex = toothIndexForRotation(state.displayRotationDeg);
+      });
+
+      canvas.addEventListener("pointermove", (event) => {
+        if (!state.dragging || event.pointerId !== state.pointerId) return;
+        const now = performance.now();
+        const currentAngle = touchAngleDegrees(canvasPoint(event));
+        const delta = normalizeDeltaDegrees(currentAngle - state.lastTouchAngle);
+        state.lastTouchAngle = currentAngle;
+        const elapsedMs = Math.max(1, now - state.lastTouchTick);
+        state.lastTouchTick = now;
+        const elapsedSec = elapsedMs / 1000;
+
+        if (Math.abs(delta) < 0.01) {
+          if (now - state.lastDragMotionTick > dragIdleDampingDelayMs) {
+            state.angularVelocityDegS *= 0.92;
+          }
+          if (Math.abs(state.angularVelocityDegS) < 5) state.angularVelocityDegS = 0;
+          return;
+        }
+
+        const instantVelocity = clamp(delta / elapsedSec, -maxAngularVelocityDegS, maxAngularVelocityDegS);
+        state.angularVelocityDegS = clamp(
+          state.angularVelocityDegS * velocityFilterKeep + instantVelocity * velocityFilterNew,
+          -maxAngularVelocityDegS,
+          maxAngularVelocityDegS,
+        );
+        state.lastDragMotionTick = now;
+        state.displayRotationDeg += delta;
+        if (Math.abs(state.displayRotationDeg) > 36000) state.displayRotationDeg %= 360;
+        updateToothFeedback();
+      });
+
+      function releasePointer(event) {
+        if (!state.dragging || event.pointerId !== state.pointerId) return;
+        const now = performance.now();
+        state.dragging = false;
+        state.pointerId = null;
+        canvas.classList.remove("dragging");
+        const hasRecentMotion = now - state.lastDragMotionTick <= releaseVelocityGraceMs;
+        state.angularVelocityDegS = clamp(
+          state.angularVelocityDegS * inertiaReleaseBoost,
+          -maxAngularVelocityDegS,
+          maxAngularVelocityDegS,
+        );
+        if (hasRecentMotion && Math.abs(state.angularVelocityDegS) >= inertiaStartVelocityDegS) {
+          state.inertiaActive = true;
+          state.lastMotionTick = now;
+        } else {
+          state.inertiaActive = false;
+          state.angularVelocityDegS = 0;
+        }
+      }
+
+      canvas.addEventListener("pointerup", releasePointer);
+      canvas.addEventListener("pointercancel", releasePointer);
+
+      leftKey.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+        state.leftDown = true;
+        updateButtonInput();
+      });
+      rightKey.addEventListener("pointerdown", (event) => {
+        event.preventDefault();
+        state.rightDown = true;
+        updateButtonInput();
+      });
+      window.addEventListener("pointerup", () => {
+        state.leftDown = false;
+        state.rightDown = false;
+        updateButtonInput();
+      });
+
+      window.addEventListener("keydown", (event) => {
+        if (event.key === "a" || event.key === "A" || event.key === "ArrowLeft") {
+          state.leftDown = true;
+          updateButtonInput();
+        }
+        if (event.key === "d" || event.key === "D" || event.key === "ArrowRight") {
+          state.rightDown = true;
+          updateButtonInput();
+        }
+      });
+
+      window.addEventListener("keyup", (event) => {
+        if (event.key === "a" || event.key === "A" || event.key === "ArrowLeft") {
+          state.leftDown = false;
+          updateButtonInput();
+        }
+        if (event.key === "d" || event.key === "D" || event.key === "ArrowRight") {
+          state.rightDown = false;
+          updateButtonInput();
+        }
+      });
+
+      state.lastToothIndex = toothIndexForRotation(state.displayRotationDeg);
+      requestAnimationFrame(animate);
+    })();
+  </script>
+</body>
+</html>
