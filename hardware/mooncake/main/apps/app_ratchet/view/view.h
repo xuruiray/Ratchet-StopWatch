@@ -6,6 +6,7 @@
 #pragma once
 #include <smooth_lvgl.hpp>
 #include <uitk/short_namespace.hpp>
+#include <array>
 #include <atomic>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -16,6 +17,8 @@ namespace view {
 
 class RatchetView {
 public:
+    static constexpr int GearFrameCount = 16;
+
     ~RatchetView();
 
     void init(lv_obj_t* parent);
@@ -24,16 +27,16 @@ public:
 private:
     std::unique_ptr<uitk::lvgl_cpp::Container> _panel;
     std::unique_ptr<uitk::lvgl_cpp::Container> _touch_mask;
-    std::vector<uint8_t> _gear_frame_data;
-    std::vector<lv_image_dsc_t> _gear_frame_dscs;
-    std::vector<uint8_t> _gear_frame_ready;
-    std::vector<uint16_t> _gear_radius_cache;
-    std::vector<int16_t> _gear_degrees_cache;
+    uint8_t* _gear_frame_data = nullptr;
+    std::array<lv_image_dsc_t, GearFrameCount> _gear_frame_dscs = {};
+    std::array<std::atomic<uint8_t>, GearFrameCount> _gear_frame_ready = {};
+    uint16_t* _gear_radius_cache = nullptr;
+    int16_t* _gear_degrees_cache = nullptr;
     std::unique_ptr<uitk::lvgl_cpp::Image> _gear_image;
-    std::vector<uint8_t> _highlight_overlay_data;
+    uint8_t* _highlight_overlay_data = nullptr;
     lv_image_dsc_t _highlight_overlay_dsc = {};
     std::unique_ptr<uitk::lvgl_cpp::Image> _highlight_overlay;
-    std::vector<uint8_t> _notch_image_data;
+    uint8_t* _notch_image_data = nullptr;
     lv_image_dsc_t _notch_image_dsc = {};
     std::unique_ptr<uitk::lvgl_cpp::Image> _notch_image;
 
@@ -49,7 +52,8 @@ private:
     uint32_t _last_drag_motion_tick = 0;
     int _last_frame_index = -1;
     bool _inertia_active = false;
-    TaskHandle_t _gear_builder_task = nullptr;
+    bool _runtime_images_ready = false;
+    std::atomic<TaskHandle_t> _gear_builder_task { nullptr };
     std::atomic_bool _gear_builder_stop { false };
 
     void updateTouch(uint32_t now);
@@ -60,6 +64,7 @@ private:
     void applyNotchTransform();
     void renderGearFrame(int frame);
     void clearGearBuildCache();
+    void clearRuntimeBuffers();
     void startGearBuilderTask();
     void stopGearBuilderTask();
     void runGearBuilderTask();
@@ -69,9 +74,9 @@ private:
     float touchAngleDegrees(const lv_point_t& point) const;
     void updateToothFeedback();
     void triggerFeedback();
-    void buildRuntimeGearFrames();
-    void buildHighlightOverlayImage();
-    void buildNotchImage();
+    bool buildRuntimeGearFrames();
+    bool buildHighlightOverlayImage();
+    bool buildNotchImage();
 };
 
 }  // namespace view

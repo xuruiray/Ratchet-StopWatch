@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: MIT
  */
 #include "view.h"
+#include <esp_heap_caps.h>
 #include <hal/hal.h>
+#include <mooncake_log.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -20,7 +22,7 @@ constexpr int _panel_center               = _panel_size / 2;
 constexpr int _gear_size                  = 300;
 constexpr int _gear_pivot                 = _gear_size / 2;
 constexpr int _gear_teeth                 = 9;
-constexpr int _gear_frame_count           = 16;
+constexpr int _gear_frame_count           = RatchetView::GearFrameCount;
 constexpr int _gear_touch_radius_min      = 32;
 constexpr int _gear_touch_radius_max      = 178;
 constexpr int _gear_outer_radius          = 139;
@@ -57,6 +59,32 @@ constexpr int _gear_builder_yield_rows    = 8;
 constexpr int _gear_frame_build_order[]   = {
     8, 4, 12, 2, 6, 10, 14, 1, 3, 5, 7, 9, 11, 13, 15,
 };
+constexpr const char* _log_tag            = "RatchetView";
+
+void* allocate_psram_buffer(std::size_t bytes, const char* label)
+{
+    if (bytes == 0) {
+        return nullptr;
+    }
+
+    void* buffer = heap_caps_calloc(1, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buffer == nullptr) {
+        buffer = heap_caps_calloc(1, bytes, MALLOC_CAP_8BIT);
+    }
+    if (buffer == nullptr) {
+        mclog::tagError(_log_tag, "failed to allocate {} bytes for {}", bytes, label);
+    }
+    return buffer;
+}
+
+template <typename T>
+void free_heap_buffer(T*& buffer)
+{
+    if (buffer != nullptr) {
+        heap_caps_free(buffer);
+        buffer = nullptr;
+    }
+}
 
 float normalize_delta_degrees(float delta)
 {
@@ -403,22 +431,32 @@ void play_ratchet_click()
 RatchetView::~RatchetView()
 {
     stopGearBuilderTask();
+    clearRuntimeBuffers();
 }
 
-void RatchetView::buildRuntimeGearFrames()
+bool RatchetView::buildRuntimeGearFrames()
 {
     constexpr std::size_t pixel_count = static_cast<std::size_t>(_gear_size) * static_cast<std::size_t>(_gear_size);
     constexpr std::size_t frame_bytes = pixel_count * 2;
-    _gear_frame_data.assign(frame_bytes * _gear_frame_count, 0);
-    _gear_frame_dscs.assign(_gear_frame_count, {});
-    _gear_frame_ready.assign(_gear_frame_count, 0);
-    _gear_radius_cache.assign(pixel_count, 0);
-    _gear_degrees_cache.assign(pixel_count, 0);
+    _gear_frame_data =
+        static_cast<uint8_t*>(allocate_psram_buffer(frame_bytes * _gear_frame_count, "gear frames"));
+    _gear_radius_cache =
+        static_cast<uint16_t*>(allocate_psram_buffer(pixel_count * sizeof(uint16_t), "gear radius cache"));
+    _gear_degrees_cache =
+        static_cast<int16_t*>(allocate_psram_buffer(pixel_count * sizeof(int16_t), "gear angle cache"));
+    if (_gear_frame_data == nullptr || _gear_radius_cache == nullptr || _gear_degrees_cache == nullptr) {
+        clearRuntimeBuffers();
+        return false;
+    }
+
+    for (auto& ready : _gear_frame_ready) {
+        ready.store(0, std::memory_order_relaxed);
+    }
 
     const float center = static_cast<float>(_gear_size) * 0.5f;
 
     for (int frame = 0; frame < _gear_frame_count; ++frame) {
-        uint8_t* frame_data = _gear_frame_data.data() + (static_cast<std::size_t>(frame) * frame_bytes);
+        uint8_t* frame_data = _gear_frame_data + (static_cast<std::size_t>(frame) * frame_bytes);
         auto& dsc            = _gear_frame_dscs[frame];
         dsc                  = {};
         dsc.header.cf        = LV_COLOR_FORMAT_RGB565;
@@ -443,26 +481,29 @@ void RatchetView::buildRuntimeGearFrames()
     }
 
     renderGearFrame(0);
+    return _gear_frame_ready[0].load(std::memory_order_acquire) != 0;
 }
 
 void RatchetView::renderGearFrame(int frame)
 {
-    if (frame < 0 || frame >= _gear_frame_count || _gear_frame_ready.empty()) {
+    if (frame < 0 || frame >= _gear_frame_count || _gear_frame_data == nullptr ||
+        _gear_radius_cache == nullptr || _gear_degrees_cache == nullptr) {
         return;
     }
-    if (_gear_frame_ready[frame] != 0) {
+    if (_gear_frame_ready[frame].load(std::memory_order_acquire) != 0) {
         return;
     }
 
     constexpr std::size_t pixel_count = static_cast<std::size_t>(_gear_size) * static_cast<std::size_t>(_gear_size);
     constexpr std::size_t frame_bytes = pixel_count * 2;
-    uint8_t* frame_data = _gear_frame_data.data() + (static_cast<std::size_t>(frame) * frame_bytes);
+    uint8_t* frame_data = _gear_frame_data + (static_cast<std::size_t>(frame) * frame_bytes);
     const float phase   = (static_cast<float>(frame) / static_cast<float>(_gear_frame_count)) * _tooth_angle_deg;
 
-    const bool background_build = _gear_builder_task != nullptr && xTaskGetCurrentTaskHandle() == _gear_builder_task;
+    const TaskHandle_t builder_task = _gear_builder_task.load(std::memory_order_acquire);
+    const bool background_build = builder_task != nullptr && xTaskGetCurrentTaskHandle() == builder_task;
 
     for (int y = 0; y < _gear_size; ++y) {
-        if (background_build && _gear_builder_stop.load()) {
+        if (background_build && _gear_builder_stop.load(std::memory_order_acquire)) {
             return;
         }
 
@@ -482,33 +523,35 @@ void RatchetView::renderGearFrame(int frame)
         }
     }
 
-    _gear_frame_ready[frame] = 1;
+    _gear_frame_ready[frame].store(1, std::memory_order_release);
 }
 
 void RatchetView::startGearBuilderTask()
 {
-    if (_gear_builder_task != nullptr) {
+    if (_gear_builder_task.load(std::memory_order_acquire) != nullptr) {
         return;
     }
 
-    _gear_builder_stop.store(false);
+    _gear_builder_stop.store(false, std::memory_order_release);
+    TaskHandle_t created_task = nullptr;
     const BaseType_t result = xTaskCreate(
         gearBuilderTaskEntry,
         "ratchet_frames",
         _gear_builder_stack_size,
         this,
         _gear_builder_priority,
-        &_gear_builder_task);
+        &created_task);
     if (result != pdPASS) {
-        _gear_builder_task = nullptr;
+        _gear_builder_task.store(nullptr, std::memory_order_release);
         return;
     }
+    _gear_builder_task.store(created_task, std::memory_order_release);
 }
 
 void RatchetView::stopGearBuilderTask()
 {
-    _gear_builder_stop.store(true);
-    while (_gear_builder_task != nullptr) {
+    _gear_builder_stop.store(true, std::memory_order_release);
+    while (_gear_builder_task.load(std::memory_order_acquire) != nullptr) {
         vTaskDelay(1);
     }
 }
@@ -516,7 +559,7 @@ void RatchetView::stopGearBuilderTask()
 void RatchetView::runGearBuilderTask()
 {
     for (int frame : _gear_frame_build_order) {
-        if (_gear_builder_stop.load()) {
+        if (_gear_builder_stop.load(std::memory_order_acquire)) {
             break;
         }
         renderGearFrame(frame);
@@ -524,13 +567,14 @@ void RatchetView::runGearBuilderTask()
     }
 
     clearGearBuildCache();
-    _gear_builder_task = nullptr;
+    _gear_builder_task.store(nullptr, std::memory_order_release);
 }
 
 void RatchetView::gearBuilderTaskEntry(void* userData)
 {
     auto* self = static_cast<RatchetView*>(userData);
     if (self != nullptr) {
+        self->_gear_builder_task.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
         self->runGearBuilderTask();
     }
     vTaskDelete(nullptr);
@@ -538,21 +582,21 @@ void RatchetView::gearBuilderTaskEntry(void* userData)
 
 int RatchetView::nearestReadyFrameIndex(int requestedFrame) const
 {
-    if (_gear_frame_ready.empty()) {
+    if (!_runtime_images_ready) {
         return 0;
     }
-    if (_gear_frame_ready[requestedFrame] != 0) {
+    if (_gear_frame_ready[requestedFrame].load(std::memory_order_acquire) != 0) {
         return requestedFrame;
     }
 
     for (int offset = 1; offset <= _gear_frame_count / 2; ++offset) {
         const int forward = (requestedFrame + offset) % _gear_frame_count;
-        if (_gear_frame_ready[forward] != 0) {
+        if (_gear_frame_ready[forward].load(std::memory_order_acquire) != 0) {
             return forward;
         }
 
         const int backward = (requestedFrame - offset + _gear_frame_count) % _gear_frame_count;
-        if (_gear_frame_ready[backward] != 0) {
+        if (_gear_frame_ready[backward].load(std::memory_order_acquire) != 0) {
             return backward;
         }
     }
@@ -562,18 +606,38 @@ int RatchetView::nearestReadyFrameIndex(int requestedFrame) const
 
 void RatchetView::clearGearBuildCache()
 {
-    _gear_radius_cache.clear();
-    _gear_radius_cache.shrink_to_fit();
-    _gear_degrees_cache.clear();
-    _gear_degrees_cache.shrink_to_fit();
+    free_heap_buffer(_gear_radius_cache);
+    free_heap_buffer(_gear_degrees_cache);
 }
 
-void RatchetView::buildHighlightOverlayImage()
+void RatchetView::clearRuntimeBuffers()
+{
+    _runtime_images_ready = false;
+    for (auto& ready : _gear_frame_ready) {
+        ready.store(0, std::memory_order_relaxed);
+    }
+    for (auto& dsc : _gear_frame_dscs) {
+        dsc = {};
+    }
+
+    _highlight_overlay_dsc = {};
+    _notch_image_dsc       = {};
+    free_heap_buffer(_gear_frame_data);
+    free_heap_buffer(_highlight_overlay_data);
+    free_heap_buffer(_notch_image_data);
+    clearGearBuildCache();
+}
+
+bool RatchetView::buildHighlightOverlayImage()
 {
     constexpr std::size_t pixel_count = static_cast<std::size_t>(_gear_size) * static_cast<std::size_t>(_gear_size);
-    _highlight_overlay_data.assign(pixel_count * 3, 0);
+    _highlight_overlay_data =
+        static_cast<uint8_t*>(allocate_psram_buffer(pixel_count * 3, "highlight overlay"));
+    if (_highlight_overlay_data == nullptr) {
+        return false;
+    }
 
-    uint8_t* color_plane = _highlight_overlay_data.data();
+    uint8_t* color_plane = _highlight_overlay_data;
     uint8_t* alpha_plane = color_plane + pixel_count * 2;
     const float center   = static_cast<float>(_gear_size) * 0.5f;
 
@@ -597,15 +661,20 @@ void RatchetView::buildHighlightOverlayImage()
     _highlight_overlay_dsc.header.w     = _gear_size;
     _highlight_overlay_dsc.header.h     = _gear_size;
     _highlight_overlay_dsc.data_size    = pixel_count * 3;
-    _highlight_overlay_dsc.data         = _highlight_overlay_data.data();
+    _highlight_overlay_dsc.data         = _highlight_overlay_data;
+    return true;
 }
 
-void RatchetView::buildNotchImage()
+bool RatchetView::buildNotchImage()
 {
     constexpr std::size_t pixel_count = static_cast<std::size_t>(_notch_width) * static_cast<std::size_t>(_notch_height);
-    _notch_image_data.assign(pixel_count * 3, 0);
+    _notch_image_data =
+        static_cast<uint8_t*>(allocate_psram_buffer(pixel_count * 3, "notch image"));
+    if (_notch_image_data == nullptr) {
+        return false;
+    }
 
-    uint8_t* color_plane = _notch_image_data.data();
+    uint8_t* color_plane = _notch_image_data;
     uint8_t* alpha_plane = color_plane + pixel_count * 2;
 
     for (int y = 0; y < _notch_height; ++y) {
@@ -628,7 +697,8 @@ void RatchetView::buildNotchImage()
     _notch_image_dsc.header.w     = _notch_width;
     _notch_image_dsc.header.h     = _notch_height;
     _notch_image_dsc.data_size    = pixel_count * 3;
-    _notch_image_dsc.data         = _notch_image_data.data();
+    _notch_image_dsc.data         = _notch_image_data;
+    return true;
 }
 
 void RatchetView::init(lv_obj_t* parent)
@@ -645,9 +715,13 @@ void RatchetView::init(lv_obj_t* parent)
     _panel->setBgColor(lv_color_hex(_bg_color));
     _panel->setBgOpa(LV_OPA_COVER);
     _panel->removeFlag(LV_OBJ_FLAG_SCROLLABLE);
-    buildRuntimeGearFrames();
-    buildHighlightOverlayImage();
-    buildNotchImage();
+
+    if (!buildRuntimeGearFrames() || !buildHighlightOverlayImage() || !buildNotchImage()) {
+        mclog::tagError(_log_tag, "runtime image initialization failed");
+        clearRuntimeBuffers();
+        return;
+    }
+    _runtime_images_ready = true;
 
     _gear_image = std::make_unique<Image>(_panel->get());
     _gear_image->setSrc(&_gear_frame_dscs[0]);
@@ -683,6 +757,10 @@ void RatchetView::init(lv_obj_t* parent)
 
 void RatchetView::update(bool leftButtonPressed, bool rightButtonPressed, bool bothButtonsPressed)
 {
+    if (!_runtime_images_ready) {
+        return;
+    }
+
     const uint32_t now = GetHAL().millis();
     updateTouch(now);
     updateButtonInput(now, leftButtonPressed, rightButtonPressed, bothButtonsPressed);
@@ -858,7 +936,7 @@ void RatchetView::stopMotion(bool stopFeedback)
 
 void RatchetView::applyGearFrame(bool force)
 {
-    if (_gear_image == nullptr || _gear_frame_dscs.empty()) {
+    if (_gear_image == nullptr || !_runtime_images_ready) {
         return;
     }
 
